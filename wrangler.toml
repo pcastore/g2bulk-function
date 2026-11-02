@@ -1,0 +1,14 @@
+name = "g2bulk-function"
+main = "g2bulk-function.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[observability]
+enabled = true
+
+# Secrets (Cloudflare dashboard -> Settings -> Variables and Secrets, type "Secret"):
+#   FIREBASE_PROJECT_ID
+#   FIREBASE_CLIENT_EMAIL
+#   FIREBASE_PRIVATE_KEY
+#   G2BULK_SIGNING_SECRET   (whsec_... from G2Bulk -> API Access -> Webhooks)
+# Don't put them in this file.
