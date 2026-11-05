@@ -212,7 +212,52 @@ async function sendFcmPush(env, fcmToken, title, body, data = {}) {
   }
 }
 
+// Same /notify-order-status endpoint (pcastore Worker) telegram-worker.js uses. Without this the customer only got a
+// web push when G2Bulk's webhook finished their order - never the "completed" message inside the Telegram bot chat.
+// Bind this Worker to pcastore as a Service Binding named AUTH_WORKER (workers.dev -> workers.dev fetch hits error 1042).
+const AUTH_WORKER_URL = 'https://pcastore.pca-game-store.workers.dev';
+function callAuthWorker(env, path, init) {
+  const url = `${env.AUTH_WORKER_URL || AUTH_WORKER_URL}${path}`;
+  return env.AUTH_WORKER && typeof env.AUTH_WORKER.fetch === 'function' ? env.AUTH_WORKER.fetch(url, init) : fetch(url, init);
+}
+
+async function notifyOrderDm(env, orderDoc, orderId, status) {
+  try {
+    const userId = orderDoc.fields.userId;
+    if (!userId) return;
+    const userDoc = await getDoc(env, `users/${userId}`);
+    const telegramId = userDoc && userDoc.fields.telegramId;
+    if (!telegramId) return; // never linked Telegram - nothing to send
+    const fresh = await getDoc(env, `orders/${orderId}`);
+    if (fresh && fresh.fields.dmSentStatus === status) return; // already sent for this status
+    const secretDoc = await getDoc(env, 'settings/adminBroadcast');
+    const secret = (secretDoc && secretDoc.fields.secret) || env.ADMIN_BROADCAST_SECRET || '';
+    if (!secret) { console.error('notifyOrderDm: no adminBroadcast secret configured'); return; }
+    const f = (fresh && fresh.fields) || orderDoc.fields;
+    const res = await callAuthWorker(env, '/notify-order-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret, telegramId, orderId, status,
+        game: f.game || '', price: f.price || 0,
+        userName: (f.resolvedCustomerName && String(f.resolvedCustomerName).trim()) || (f.userName && String(f.userName).trim()) || 'Guest',
+        userId, inGameId: f.playerId || '', serverId: f.serverId || '',
+        packageName: (f.itemAmount || '') + (Number(f.quantity) > 1 ? ` ×${Number(f.quantity)}` : ''),
+      }),
+    });
+    if (!res.ok) console.error('notifyOrderDm failed', res.status, await res.text());
+    else await patchDoc(env, `orders/${orderId}`, { dmSentStatus: status }, ['dmSentStatus']);
+  } catch (err) {
+    console.error('notifyOrderDm error', orderId, err);
+  }
+}
+
 async function notifyOrderStatus(env, orderDoc, orderId, status) {
+  await notifyOrderPush(env, orderDoc, orderId, status);
+  await notifyOrderDm(env, orderDoc, orderId, status);
+}
+
+async function notifyOrderPush(env, orderDoc, orderId, status) {
   try {
     if (!orderDoc.fields.userId) return;
     const userDoc = await getDoc(env, `users/${orderDoc.fields.userId}`);
@@ -246,8 +291,13 @@ async function finalizeFailureWithRefund(env, orderId, orderDoc, statusNote, ext
   for (const k in extraFields) orderFieldsEncoded[k] = encodeValue(extraFields[k]);
   const orderFieldPaths = ['status', 'statusNote', ...Object.keys(extraFields)];
 
-  const amount = refundAmount === null ? Number(orderDoc.fields.price) : refundAmount;
+  // walletFlow 2 orders are charged only AFTER the provider accepts them: if the debit has not happened,
+  // there is nothing to give back. Refund exactly what was debited (partial orders shrink the price first).
+  const amount = refundAmount === null
+    ? Math.round(Number(orderDoc.fields.walletDebitedAmount || orderDoc.fields.price))
+    : refundAmount;
   const eligibleForRefund = orderDoc.fields.paidFromWallet === true
+    && walletWasCharged(orderDoc.fields)
     && !orderDoc.fields.walletRefunded
     && orderDoc.fields.userId
     && typeof amount === 'number' && amount > 0;
@@ -258,10 +308,6 @@ async function finalizeFailureWithRefund(env, orderId, orderDoc, statusNote, ext
   }
 
   const userPath = `users/${orderDoc.fields.userId}`;
-  const userDoc = await getDoc(env, userPath);
-  const currentBalance = Number((userDoc && userDoc.fields.walletBalance) || 0);
-  const refundedBalance = currentBalance + amount;
-
   orderFieldsEncoded.walletRefunded = { booleanValue: true };
   orderFieldsEncoded.refundedAt = { timestampValue: new Date().toISOString() };
   orderFieldPaths.push('walletRefunded', 'refundedAt');
@@ -272,14 +318,28 @@ async function finalizeFailureWithRefund(env, orderId, orderDoc, statusNote, ext
       updateMask: { fieldPaths: orderFieldPaths },
       currentDocument: { updateTime: orderDoc.updateTime }
     },
-    {
-      update: { name: docName(env, userPath), fields: { walletBalance: encodeValue(refundedBalance) } },
-      updateMask: { fieldPaths: ['walletBalance'] }
-    }
+    walletIncrementWrite(env, userPath, amount)
   ]);
   if (result.error) {
     console.error(`finalizeFailureWithRefund: commit failed for ${orderId}`, JSON.stringify(result.error));
   }
+}
+
+const WALLET_FLOW = 2; // keep in sync with telegram-worker.js (provider first, wallet charged second)
+
+// True when the customer's wallet has really been charged for this order (same rule as telegram-worker.js).
+function walletWasCharged(fields) {
+  return fields.walletFlow !== WALLET_FLOW || fields.walletDebited === true;
+}
+
+// Atomic server-side `walletBalance += amount` (same as telegram-worker.js). The old code wrote an absolute
+// balance it had read earlier, which could wipe out a purchase/top-up that landed in between.
+function walletIncrementWrite(env, userPath, amount) {
+  return {
+    update: { name: docName(env, userPath), fields: { walletUpdatedAt: encodeValue(new Date()) } },
+    updateMask: { fieldPaths: ['walletUpdatedAt'] },
+    updateTransforms: [{ fieldPath: 'walletBalance', increment: { integerValue: String(Math.round(amount)) } }]
+  };
 }
 
 function sleep(ms) {
@@ -292,20 +352,8 @@ function sleep(ms) {
 // can't go through finalizeFailureWithRefund, which always marks Fail.
 async function creditWalletRefund(env, userId, amount) {
   if (!userId || !(amount > 0)) return;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const userPath = `users/${userId}`;
-    const userDoc = await getDoc(env, userPath);
-    if (!userDoc) return;
-    const currentBalance = Number(userDoc.fields.walletBalance || 0);
-    const result = await commitWrites(env, [{
-      update: { name: docName(env, userPath), fields: { walletBalance: encodeValue(currentBalance + amount) } },
-      updateMask: { fieldPaths: ['walletBalance'] },
-      currentDocument: { updateTime: userDoc.updateTime }
-    }]);
-    if (!result.error) return;
-    await sleep(150 + Math.random() * 250); // lost the race to a concurrent write - re-read balance and retry
-  }
-  console.error('creditWalletRefund: gave up after retries for user', userId);
+  const result = await commitWrites(env, [walletIncrementWrite(env, `users/${userId}`, amount)]);
+  if (result.error) console.error('creditWalletRefund failed for user', userId, JSON.stringify(result.error));
 }
 
 // Records this unit's terminal result (COMPLETED/FAILED) into the order's

@@ -12,3 +12,9 @@ enabled = true
 #   FIREBASE_PRIVATE_KEY
 #   G2BULK_SIGNING_SECRET   (whsec_... from G2Bulk -> API Access -> Webhooks)
 # Don't put them in this file.
+
+# Customer "order completed" DM in the Telegram bot: calls pcastore's /notify-order-status directly
+# (plain workers.dev -> workers.dev fetch fails with error 1042)
+[[services]]
+binding = "AUTH_WORKER"
+service = "pcastore"
